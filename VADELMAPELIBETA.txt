@@ -1,0 +1,435 @@
+import pygame
+import sqlite3
+from sense_hat import SenseHat
+import random
+import sys
+import os
+import time
+import pygame.mixer
+
+# Initialize Pygame
+pygame.init()
+
+# Initialize Pygame mixer
+pygame.mixer.init()
+
+# Initialize Sense HAT
+sense = SenseHat()
+
+# Constants (adjust as needed)
+WIDTH, HEIGHT = 640, 480
+WHITE = (255, 255, 255)
+PLAYER_SIZE = 40
+PLATFORM_COLOR = (0, 128, 0)
+GRAVITY = 0.6
+JUMP_STRENGTH = -15
+ACCELEROMETER_SENSITIVITY = 2
+FONT_SIZE = 36
+MAX_PLATFORMS = 10
+PLATFORM_GAP = 100
+
+# Paths to external resources
+SOUND_PATH = "sounds"
+IMAGE_PATH = "images"
+
+# Load sound effects
+jump_sound = pygame.mixer.Sound("jump.wav")
+death_sound = pygame.mixer.Sound("jaahuhuhui.wav")
+main_menu_music = pygame.mixer.Sound("mainmenu.wav")
+start_menu_bg = pygame.image.load("mainmenu_bg.jpg")
+
+# Maximum camera Y position to prevent the scene from changing upwards
+MAX_CAMERA_Y = HEIGHT // 2
+
+# Create the game window
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Vadelmapeli")
+
+# Player variables
+class Player:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.x = WIDTH // 2 - PLAYER_SIZE // 2
+        self.y = HEIGHT - PLAYER_SIZE
+        self.velocity_y = 0
+        self.acceleration_x = 0
+
+# Game state variables
+class GameState:
+    def __init__(self):
+        self.game_over = True
+        self.start_menu = True
+        self.player_dead = False
+        self.enter_name = False
+        self.player_name = ""
+        self.start_timer = False
+        self.timer_duration = 10
+        self.timer_start_time = None
+        self.player_highest_height = 0
+        self.leaderboard_updated = False
+        main_menu_music.play()
+
+
+        # Fade transition variables
+        self.fade_transition = False
+        self.fade_alpha = 255  # Initialize the alpha value to fully opaque
+
+        # Water rising variables
+        self.start_water_rising = False
+        self.water_elapsed_time = 0
+
+game_state = GameState()
+
+player = Player()
+
+# Initialize platform generation variables
+platforms = []
+
+# Load the custom platform image and specify the desired size
+platform_image = pygame.image.load("platform.png")
+platform_width = 150
+platform_height = 30
+platform2_width = 2000
+platform2_height = 900
+
+# Scale the loaded image to the desired size
+platform_image = pygame.transform.scale(platform_image, (platform2_width, platform2_height))
+
+# Create the starting platform using the custom image
+starting_platform_rect = pygame.Rect(0, HEIGHT - platform_height * 2, platform_width, platform_height)
+platforms.append(starting_platform_rect)
+
+# Replace the black platform with the custom image
+bottom_platform_rect = pygame.Rect(0, HEIGHT - platform_height, WIDTH, platform_height)
+platforms.append(bottom_platform_rect)
+
+# Load the water images
+water_surface = pygame.image.load("water_top.png")
+water_bottom = pygame.image.load("water_bottom.png")
+
+# Calculate the initial water level based on the player's highest platform
+game_state.water_level = HEIGHT // 2
+
+# Camera variables
+class Camera:
+    def __init__(self):
+        self.y = 0
+
+camera = Camera()
+CAMERA_SPEED = 5
+
+# Load font
+font = pygame.font.Font(None, FONT_SIZE)
+
+# Initialize SQLite database and create a table (moved to the beginning)
+conn = sqlite3.connect("leaderboard.db")
+cursor = conn.cursor()
+cursor.execute('''CREATE TABLE IF NOT EXISTS leaderboard (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  player_name TEXT,
+                  score INTEGER)''')
+conn.commit()
+
+# Function to insert player name and score into the database
+def insert_score(player_name, score):
+    try:
+        cursor.execute("INSERT INTO leaderboard (player_name, score) VALUES (?, ?)", (player_name, score))
+        conn.commit()
+    except sqlite3.Error as e:
+        print("SQLite Error:", e)
+
+# Function to retrieve leaderboard data from the database
+def retrieve_leaderboard():
+    try:
+        cursor.execute("SELECT player_name, score FROM leaderboard ORDER BY score DESC LIMIT 10")
+        return cursor.fetchall()
+    except sqlite3.Error as e:
+        print("SQLite Error:", e)
+        return []
+
+# Load leaderboard data at the beginning
+leaderboard = retrieve_leaderboard()
+
+# Define the start_text variable here
+start_text = font.render("Shake to Start", True, (0, 0, 0))
+
+# Timer variables
+class Timer:
+    def __init__(self):
+        self.start_timer = False
+        self.timer_duration = 10
+        self.timer_start_time = None
+
+timer = Timer()
+
+# Function to reset player data
+def reset_player():
+    player.reset()
+
+# Function to reset the game map
+def reset_map():
+    global platforms, collectibles, last_platform_y, camera
+
+    # Clear platforms and collectibles lists
+    platforms.clear()
+    collectibles.clear()
+
+    # Reset last platform Y position and camera
+    last_platform_y = HEIGHT - PLATFORM_GAP
+    camera.y = 0
+
+    # Create the starting platform using the custom image
+    platforms.append(starting_platform_rect)
+
+    # Replace the black platform with the custom image
+    platforms.append(bottom_platform_rect)
+
+# Function to handle saving leaderboard data
+def handle_game_over():
+    if not game_state.leaderboard_updated and game_state.player_name:
+        game_state.player_score = game_state.player_highest_height  # Update the player's score
+        insert_score(game_state.player_name, game_state.player_score)  # Update score with the player's highest height
+        game_state.leaderboard_updated = True
+
+# Load collectible image
+collectible_image = pygame.image.load("Rapsperry.png")
+collectible_width = 30
+collectible_height = 30
+
+# Scale the collectible image to the desired size
+collectible_image = pygame.transform.scale(collectible_image, (collectible_width, collectible_height))
+
+class Collectible:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.active = True
+
+# Initialize collectibles list
+collectibles = []
+
+# Function to check for collisions between player and collectibles
+def check_collectibles_collision():
+    for collectible in collectibles:
+        if collectible.active and pygame.Rect(int(player.x), int(player.y), PLAYER_SIZE, PLAYER_SIZE).colliderect(
+                pygame.Rect(collectible.x, collectible.y, collectible_width, collectible_height)):
+            # Collect the collectible
+            collectible.active = False
+            game_state.player_highest_height += 200  # Add 200 to player's score
+
+# Game loop
+running = True
+clock = pygame.time.Clock()
+
+# Track the last generated platform's Y position
+last_platform_y = HEIGHT - PLATFORM_GAP
+
+# Variable to track elapsed time for water rising
+water_elapsed_time = 0
+
+# Flag to indicate when water rising should start
+game_state.start_water_rising = False
+
+# Define the fixed rising rate for the water (adjust as needed)
+WATER_RISING_RATE = 2  # You can change this rate
+
+# Function for fade transition out
+def fade_transition_out():
+    if game_state.fade_alpha > 0:
+        game_state.fade_alpha -= FADE_SPEED
+    else:
+        game_state.fade_transition = False
+
+# Function for fade transition in
+def fade_transition_in():
+    if game_state.fade_alpha < 255:
+        game_state.fade_alpha += FADE_SPEED
+    else:
+        game_state.fade_transition = False
+
+# Constants for fade transition
+FADE_SPEED = 5  # Adjust the speed of the fade transition
+
+def fade_transition():
+    if game_state.fade_transition:
+        fade_transition_out()
+        fade_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        pygame.draw.rect(fade_surface, (0, 0, 0, game_state.fade_alpha), (0, 0, WIDTH, HEIGHT))
+        screen.blit(fade_surface, (0, 0))
+
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        if game_state.enter_name:
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_BACKSPACE:
+                    game_state.player_name = game_state.player_name[:-1]
+                elif event.key == pygame.K_RETURN:
+                    game_state.enter_name = False
+                    game_state.game_over = False
+
+                    # Automatically add the player's name and score to the database
+                    if game_state.player_name:
+                        insert_score(game_state.player_name, game_state.player_highest_height)  # Update score with highest height
+                        game_state.leaderboard_updated = True
+                else:
+                    game_state.player_name += event.unicode
+
+    if game_state.start_menu:
+        leaderboard = retrieve_leaderboard()
+        reset_player()
+
+        accelerometer_data = sense.get_accelerometer_raw()
+        accelerometer_x = accelerometer_data['x']
+
+        if abs(accelerometer_x) > ACCELEROMETER_SENSITIVITY:
+            game_state.start_menu = False
+            game_state.enter_name = True
+
+    if not game_state.game_over:
+        accelerometer_data = sense.get_accelerometer_raw()
+        accelerometer_x = accelerometer_data['x']
+
+        player.acceleration_x = accelerometer_x * ACCELEROMETER_SENSITIVITY
+        player.x += player.acceleration_x * 10
+        
+        water_elapsed_time += 1 / 30
+
+        # Update the water level based on the elapsed time and rate
+        game_state.water_level = max(game_state.water_level - int(water_elapsed_time * WATER_RISING_RATE), HEIGHT // 2)
+
+
+        player.velocity_y += GRAVITY
+        player.y += player.velocity_y
+
+        player.x = max(0, min(player.x, WIDTH - PLAYER_SIZE))
+
+        if player.y > HEIGHT:
+            game_state.game_over = True
+            game_state.player_dead = True
+            death_sound.play()
+            handle_game_over()
+            reset_player()
+            reset_map()
+
+        on_platform = False
+
+        for platform in platforms:
+            if player.velocity_y >= 0 and platform.colliderect(
+                    pygame.Rect(int(player.x), int(player.y), PLAYER_SIZE, PLAYER_SIZE)):
+                player.velocity_y = JUMP_STRENGTH
+                player.y = platform.top - PLAYER_SIZE
+                on_platform = True
+
+                jump_sound.play()
+
+                game_state.player_highest_height = max(game_state.player_highest_height, int(HEIGHT - player.y))
+
+        if not on_platform:
+            has_bounced = False
+
+        while len(platforms) < MAX_PLATFORMS:
+            platform_x = random.randint(0, WIDTH - platform_width)
+            platform_y = last_platform_y - random.randint(PLATFORM_GAP // 2, PLATFORM_GAP * 2)
+            last_platform_y = platform_y
+
+            if len(platforms) == 1:
+                new_platform_rect = pygame.Rect(platform_x, platform_y, platform_width, platform_height)
+            else:
+                new_platform_rect = pygame.Rect(platform_x, platform_y, platform_width, platform_height)
+
+            platforms.append(new_platform_rect)
+
+            collectible_x = random.randint(new_platform_rect.left, new_platform_rect.right - collectible_width)
+            collectible_y = new_platform_rect.top - collectible_height
+            collectibles.append(Collectible(collectible_x, collectible_y))
+
+        platforms = [platform for
+                    platform in platforms if platform.top - camera.y < HEIGHT]
+
+        camera.y = min(player.y - HEIGHT // 2, MAX_CAMERA_Y)
+
+    screen.fill(WHITE)
+
+    if game_state.start_menu:
+        
+        screen.blit(start_text, (WIDTH // 2 - start_text.get_width() // 2, HEIGHT // 2 - start_text.get_height() // 2))
+        leaderboard_text = font.render("Leaderboard", True, (0, 0, 0))
+        screen.blit(leaderboard_text, (10, 10))
+        y_offset = 50
+
+        for idx, entry in enumerate(leaderboard):
+            leaderboard_entry_text = font.render(f"{idx + 1}. {entry[0]}: {entry[1]}", True, (0, 0, 0))
+            screen.blit(leaderboard_entry_text, (10, y_offset))
+            y_offset += 30
+
+    elif game_state.enter_name:
+        name_text = font.render("Enter Your Name:", True, (0, 0, 0))
+        screen.blit(name_text, (WIDTH // 2 - name_text.get_width() // 2, HEIGHT // 2 - FONT_SIZE // 2))
+        name_input_text = font.render(game_state.player_name, True, (0, 0, 0))
+        screen.blit(name_input_text, (WIDTH // 2 - name_input_text.get_width() // 2, HEIGHT // 2 + FONT_SIZE // 2))
+    elif game_state.game_over:
+        if not timer.start_timer:
+            timer.start_timer = True
+            timer.timer_start_time = time.time()
+            reset_player()
+
+        elapsed_time = time.time() - timer.timer_start_time
+        remaining_time = max(timer.timer_duration - elapsed_time, 0)
+
+        if remaining_time == 0:
+            game_state.start_menu = True
+            game_state.game_over = False
+            game_state.enter_name = False
+            game_state.player_name = ""
+            timer.start_timer = False
+            game_state.player_dead = False
+            game_state.leaderboard_updated = False
+            reset_player()
+            reset_map()
+
+        text = font.render("You died", True, (255, 0, 0))
+        text_rect = text.get_rect(center=(WIDTH // 2, HEIGHT // 2))
+        screen.blit(text, text_rect)
+        timer_text = font.render(f"Restarting in {int(remaining_time)} seconds", True, (0, 0, 0))
+        timer_rect = timer_text.get_rect(center=(WIDTH // 2, HEIGHT // 2 + FONT_SIZE))
+        screen.blit(timer_text, timer_rect)
+        height_text = font.render(f"Highest Height: {game_state.player_highest_height}", True, (0, 0, 0))
+        height_rect = height_text.get_rect(center=(WIDTH // 2, HEIGHT // 2 + FONT_SIZE * 2))
+        screen.blit(height_text, height_rect)
+
+    else:
+        # Rest of the code remains the same
+
+        screen.blit(water_bottom, (0, HEIGHT - water_bottom.get_height()))
+        screen.blit(water_surface, (0, HEIGHT - water_bottom.get_height() - water_surface.get_height()))
+
+        fade_transition()  # Apply fade transition
+
+        pygame.draw.rect(screen, (0, 0, 255), (int(player.x), int(player.y - camera.y), PLAYER_SIZE, PLAYER_SIZE))
+        for platform in platforms:
+            if len(platforms) == 1:
+                screen.blit(platform_image, (int(platform.x), int(platform.y - camera.y)))
+            elif platform == bottom_platform_rect:
+                screen.blit(platform_image, (int(platform.x), int(platform.y - camera.y)))
+            else:
+                pygame.draw.rect(screen, PLATFORM_COLOR, (int(platform.x), int(platform.y - camera.y), platform_width, platform_height))
+
+        check_collectibles_collision()
+
+        for collectible in collectibles:
+            if collectible.active:
+                screen.blit(collectible_image, (int(collectible.x), int(collectible.y - camera.y)))
+
+    pygame.display.flip()
+    clock.tick(30)
+
+# At the end of the game loop, close the database connection
+conn.close()
+
+pygame.quit()
+sys.exit()
